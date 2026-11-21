@@ -1,0 +1,6 @@
+[
+  {"action_id": "L1", "samples": [-8, 8, 3], "source": "试片A/左规/首载"},
+  {"action_id": "L2", "samples": [-9, 3], "source": "试片A/左规/加荷"},
+  {"action_id": "L3", "samples": [0, 0], "source": "试片A/左规/卸荷零点"},
+  {"action_id": "L4", "samples": [2], "source": "试片A/左规/留存末件"}
+]
