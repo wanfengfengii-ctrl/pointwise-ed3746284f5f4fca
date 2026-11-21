@@ -1,3 +1,4 @@
+import hashlib
 import json
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -71,7 +72,36 @@ def encode_packet(packet: WavePacket) -> str:
 
 def decode_packet(payload: str) -> WavePacket:
     value = json.loads(payload)
+    if value.get('body_cleared') is True:
+        raise RuntimeError('该原件正文已按保全票回收，不能从墓碑重建波形')
     return make_packet(
         value['shift_id'], value['device_id'], value['sequence'], value['action_id'],
         tuple(int(sample, 16) for sample in value['signed_samples']), value['source'],
     )
+
+
+def packet_digest(packet: WavePacket) -> str:
+    """Canonical SHA-256 digest of the full original packet payload."""
+    return hashlib.sha256(encode_packet(packet).encode('utf-8')).hexdigest()
+
+
+def encode_tombstone(packet: WavePacket) -> str:
+    """Persistent marker kept after the waveform body is reclaimed."""
+    identity = packet.wave_id
+    return json.dumps({
+        'body_cleared': True,
+        'shift_id': identity.shift_id,
+        'device_id': identity.device_id,
+        'sequence': identity.sequence,
+        'action_id': packet.action_id,
+        'source': packet.source,
+        'sample_count': len(packet.samples),
+        'body_digest': packet_digest(packet),
+    }, separators=(',', ':'))
+
+
+def decode_tombstone(payload: str) -> dict:
+    value = json.loads(payload)
+    if not isinstance(value, dict) or value.get('body_cleared') is not True:
+        raise RuntimeError('持久墓碑格式无效')
+    return value

@@ -3,7 +3,10 @@ from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from recorder.packet import WaveId, WavePacket, decode_packet, encode_packet, make_packet
+from recorder.packet import (
+    WaveId, WavePacket, decode_packet, encode_packet, encode_tombstone,
+    make_packet, packet_digest,
+)
 
 
 @dataclass(frozen=True)
@@ -48,8 +51,55 @@ class DeviceJournal:
                     sequence INTEGER NOT NULL CHECK (sequence > 0),
                     action_id TEXT NOT NULL,
                     packet TEXT NOT NULL,
+                    body_cleared INTEGER NOT NULL DEFAULT 0,
+                    sample_count INTEGER NOT NULL DEFAULT 0,
+                    body_digest TEXT,
                     PRIMARY KEY (shift_id, sequence),
                     UNIQUE (shift_id, action_id)
+                )
+            ''')
+            capture_columns = {
+                row['name'] for row in connection.execute('PRAGMA table_info(captures)')
+            }
+            if 'body_cleared' not in capture_columns:
+                connection.execute('ALTER TABLE captures ADD COLUMN body_cleared INTEGER NOT NULL DEFAULT 0')
+            if 'sample_count' not in capture_columns:
+                connection.execute('ALTER TABLE captures ADD COLUMN sample_count INTEGER NOT NULL DEFAULT 0')
+            if 'body_digest' not in capture_columns:
+                connection.execute('ALTER TABLE captures ADD COLUMN body_digest TEXT')
+            legacy_rows = connection.execute('''
+                SELECT shift_id, sequence, packet FROM captures
+                WHERE sample_count = 0 AND body_cleared = 0
+            ''').fetchall()
+            for row in legacy_rows:
+                packet = decode_packet(row['packet'])
+                connection.execute('''
+                    UPDATE captures
+                    SET sample_count = ?, body_digest = ?
+                    WHERE shift_id = ? AND sequence = ?
+                ''', (len(packet.samples), packet_digest(packet), row['shift_id'], row['sequence']))
+            connection.execute('''
+                CREATE TABLE IF NOT EXISTS capacity_limits (
+                    slot INTEGER PRIMARY KEY CHECK (slot = 1),
+                    max_samples INTEGER NOT NULL CHECK (max_samples > 0)
+                )
+            ''')
+            connection.execute('''
+                CREATE TABLE IF NOT EXISTS reclaims (
+                    ticket_id TEXT PRIMARY KEY NOT NULL,
+                    report_id INTEGER NOT NULL,
+                    reclaimed_samples INTEGER NOT NULL CHECK (reclaimed_samples >= 0),
+                    payload TEXT NOT NULL
+                )
+            ''')
+            connection.execute('''
+                CREATE TABLE IF NOT EXISTS reclaim_members (
+                    ticket_id TEXT NOT NULL,
+                    shift_id TEXT NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    receipt_id INTEGER NOT NULL,
+                    PRIMARY KEY (ticket_id, shift_id, sequence),
+                    FOREIGN KEY (shift_id, sequence) REFERENCES captures (shift_id, sequence)
                 )
             ''')
             connection.execute('''
@@ -80,11 +130,24 @@ class DeviceJournal:
 
     def find_capture(self, connection, shift_id: str, action_id: str) -> WavePacket | None:
         row = connection.execute('''
-            SELECT sequence FROM captures WHERE shift_id = ? AND action_id = ?
+            SELECT sequence, body_cleared FROM captures
+            WHERE shift_id = ? AND action_id = ?
         ''', (shift_id, action_id)).fetchone()
         if row is None:
             return None
+        if row['body_cleared']:
+            return None
         return self.load_packet(connection, WaveId(shift_id, self.device_id, row['sequence']))
+
+    def find_capture_row(self, connection, shift_id: str, action_id: str):
+        return connection.execute('''
+            SELECT * FROM captures WHERE shift_id = ? AND action_id = ?
+        ''', (shift_id, action_id)).fetchone()
+
+    def find_capture_by_sequence(self, connection, shift_id: str, sequence: int):
+        return connection.execute('''
+            SELECT * FROM captures WHERE shift_id = ? AND sequence = ?
+        ''', (shift_id, sequence)).fetchone()
 
     def last_sequence(self, connection, shift_id: str) -> int:
         return connection.execute('''
@@ -95,18 +158,24 @@ class DeviceJournal:
         sequence = self.last_sequence(connection, shift_id) + 1
         packet = make_packet(shift_id, self.device_id, sequence, action_id, samples, source)
         connection.execute('''
-            INSERT INTO captures (shift_id, sequence, action_id, packet) VALUES (?, ?, ?, ?)
-        ''', (shift_id, sequence, action_id, encode_packet(packet)))
+            INSERT INTO captures
+                (shift_id, sequence, action_id, packet, body_cleared, sample_count, body_digest)
+            VALUES (?, ?, ?, ?, 0, ?, ?)
+        ''', (shift_id, sequence, action_id, encode_packet(packet),
+              len(packet.samples), packet_digest(packet)))
         return packet
 
     def load_packet(self, connection, wave_id: WaveId) -> WavePacket | None:
         if wave_id.device_id != self.device_id:
             raise ValueError('设备与原件身份不符')
         row = connection.execute('''
-            SELECT action_id, packet FROM captures WHERE shift_id = ? AND sequence = ?
+            SELECT action_id, packet, body_cleared FROM captures
+            WHERE shift_id = ? AND sequence = ?
         ''', (wave_id.shift_id, wave_id.sequence)).fetchone()
         if row is None:
             return None
+        if row['body_cleared']:
+            raise RuntimeError(f'原件正文已回收 {wave_id!r}')
         try:
             packet = decode_packet(row['packet'])
         except (TypeError, ValueError, KeyError) as error:
@@ -114,3 +183,54 @@ class DeviceJournal:
         if packet.wave_id != wave_id or packet.action_id != row['action_id']:
             raise RuntimeError(f'原包与源库索引不符 {wave_id!r}')
         return packet
+
+    def clear_capture_body(self, connection, shift_id: str, sequence: int,
+                           packet: WavePacket) -> None:
+        connection.execute('''
+            UPDATE captures
+            SET packet = ?, body_cleared = 1, sample_count = ?, body_digest = ?
+            WHERE shift_id = ? AND sequence = ? AND body_cleared = 0
+        ''', (encode_tombstone(packet), len(packet.samples), packet_digest(packet),
+              shift_id, sequence))
+
+    def current_usage(self, connection) -> int:
+        """Total live sample points still held on this device across shifts."""
+        row = connection.execute('''
+            SELECT COALESCE(SUM(sample_count), 0) AS used
+            FROM captures WHERE body_cleared = 0
+        ''').fetchone()
+        return int(row['used'])
+
+    def read_capacity_limit(self, connection) -> int | None:
+        row = connection.execute('SELECT max_samples FROM capacity_limits WHERE slot = 1').fetchone()
+        return None if row is None else int(row['max_samples'])
+
+    def write_capacity_limit(self, connection, max_samples: int) -> None:
+        connection.execute('''
+            INSERT INTO capacity_limits (slot, max_samples) VALUES (1, ?)
+            ON CONFLICT(slot) DO UPDATE SET max_samples = excluded.max_samples
+        ''', (max_samples,))
+
+    def find_reclaim(self, connection, ticket_id: str):
+        return connection.execute('''
+            SELECT * FROM reclaims WHERE ticket_id = ?
+        ''', (ticket_id,)).fetchone()
+
+    def insert_reclaim(self, connection, ticket_id: str, report_id: int,
+                       reclaimed_samples: int, payload: str) -> None:
+        connection.execute('''
+            INSERT INTO reclaims (ticket_id, report_id, reclaimed_samples, payload)
+            VALUES (?, ?, ?, ?)
+        ''', (ticket_id, report_id, reclaimed_samples, payload))
+
+    def insert_reclaim_member(self, connection, ticket_id: str, shift_id: str,
+                              sequence: int, receipt_id: int) -> None:
+        connection.execute('''
+            INSERT INTO reclaim_members (ticket_id, shift_id, sequence, receipt_id)
+            VALUES (?, ?, ?, ?)
+        ''', (ticket_id, shift_id, sequence, receipt_id))
+
+    def member_ticket(self, connection, shift_id: str, sequence: int):
+        return connection.execute('''
+            SELECT ticket_id FROM reclaim_members WHERE shift_id = ? AND sequence = ?
+        ''', (shift_id, sequence)).fetchone()

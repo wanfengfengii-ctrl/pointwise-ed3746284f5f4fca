@@ -24,6 +24,13 @@ def initialize_archive_schema(connection: sqlite3.Connection) -> None:
             snapshot TEXT NOT NULL
         )
     ''')
+    connection.execute('''
+        CREATE TABLE IF NOT EXISTS custody_tickets (
+            ticket_id TEXT PRIMARY KEY NOT NULL,
+            report_id INTEGER NOT NULL,
+            payload TEXT NOT NULL
+        )
+    ''')
 
 
 def _encode_report(report: ShiftReportDraft) -> str:

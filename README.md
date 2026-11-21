@@ -12,7 +12,7 @@ python3 -B station_demo.py demo
 python3 -B station_demo.py init ./workbench
 ```
 
-`check_project.py` 是控制台提供的完整回归入口。也可直接运行 `python3 -B -m unittest discover -s tests -t .`。`demo` 在临时目录运行完整日剧本并输出实测判级和断源读回的班报。`init` 建立站库和两份独立源库，重复执行保留已存在的班次、原件、首执和报告。两条 CLI 命令发生运行错误时以非零码退出。样例只有在显式运行日剧本时才被加载。
+`check_project.py` 是控制台提供的完整回归入口。也可直接运行 `python3 -B -m unittest discover -s tests -t .`。`demo` 在临时目录运行完整日剧本并输出实测判级和断源读回的班报，随后追加保全票交接：站端先签 T1（仅 L1）和 T2（L1、L2）两张固定班报票，设备脱机分别收回 2 和 4 个样点，只靠站库核回原件后，旧动作复领原身份，并在腾出的本机空间采集新班次件。`init` 建立站库和两份独立源库，重复执行保留已存在的班次、原件、首执和报告。两条 CLI 命令发生运行错误时以非零码退出。样例只有在显式运行日剧本时才被加载。
 
 ## 一天的工作
 
@@ -35,5 +35,8 @@ python3 -B station_demo.py init ./workbench
 - `recorder.endmark.stop(ledger, journal, shift_id)` 固定本台实际末序。同台重复停采复领原末序。停采后可复投旧动作和实收留存队首。空源末序为 0。
 - `archive.freeze.seal(ledger, sources, shift_id, endmarks)` 用清册两台的持久末序封报。`sources` 是按设备号索引的记录器字典。班报按清册及源序展开正式实收，列出截至末序的未实收闭区间。已正式提交且待释放的原件计入实收。相同有效末序复领首份；后来补收可单独判级，历史班报保留封报时的条目和缺口。
 - `archive.readback.retrieve(ledger, report_id)` 只读取站库。未知报号返回 `None`，已知快照的引用缺失或身份不一致报错。
+- `recorder.retention.configure_capacity(journal, max_samples)` 登记本台跨班次的有效样点额度，`recorder.retention.usage(journal)` 返回本机仍占容量，`recorder.retention.reclaim(journal, ticket, *, before_commit=None)` 凭站端保全票脱机回收正文。正整数额度重复同值成功，改值或登记时已超额度报 `ValueError`；未登记额度的旧库无限制。新动作提交前按实际样点数检查额度，拒绝不耗源序。
+- `archive.custody.issue_ticket(ledger, ticket_id, report_id, device_id, receipt_ids)` 按指定固定班报签发可复领保全票并持久化于站库，`archive.custody.read_ticket(ledger, ticket_id)` 按号读回、未知返回 `None`。同号同参复领、同号改参拒绝；首执号非空且严格递增，且必须都在该班报该设备的正式条目内。票内写明票号、班报号、班号、设备号、各成员原首执号、原件身份、样点长度和正文摘要。
+- 回收只结算本机确已放行、摘要相符且仍留存正文的成员；已由另一有效票回收的成员跳过正文。错绑、未知票、重复成员和非法输入在移除任何正文前报 `ValueError`，提交前回调失败整体回滚。`reclaim` 返回 `{"reclaimed_samples": n, "receipt_ids": [...]}`，同票同参重送复领首次办理结果。物理正文清除后，原动作以完全相同的样点和出处重投时沿用原 `WavePacket` 身份，不重新占容量、不占源序、不入队首；改正文或出处仍拒绝。
 
 `ValueError` 表示非法输入、错绑、冲突或队首变化。`LookupError` 表示未知班次或首执。`RuntimeError` 表示持久证据异常。SQLite 和文件系统故障沿原异常传递。实收入口接受可选的 `before_commit`、`before_release`、`after_release` 检查点回调，封报接受 `before_commit`。提交前回调在事务内执行；回调抛错时事务回滚。释放后回调在源提交之后执行，可用于演练失答。检查点回调在实收与封报中分别接收首执和档案记录。
